@@ -339,12 +339,28 @@ When the user asks you to add, schedule, or block any event, include this block:
 }
 <<<END>>>
 
-Rules:
+When the user asks you to remove, delete, or cancel an event, include this block:
+
+<<<DELETE>>>
+{
+  "title": "Event title",
+  "date": "YYYY-MM-DD",
+  "hour": 9
+}
+<<<END>>>
+
+Rules for EVENT:
 - date must be YYYY-MM-DD (today is REPLACE_TODAY)
 - hour is 0-23 integer
 - cat: work, personal, health, or "" for general
 - dur in minutes: 30, 60, 90, 120, 180
 - You can emit multiple blocks
+
+Rules for DELETE:
+- Match by title+date+hour from the schedule context above
+- You can emit multiple DELETE blocks
+- Always confirm what was removed
+
 - Keep your text reply under 120 words""",
         schedule_ctx,
         get_contacts_context(),
@@ -390,6 +406,37 @@ Rules:
 
     clean_reply = re.sub(r"<<<EVENT>>>\s*([\s\S]*?)\s*<<<END>>>", replace_block, reply).strip()
 
+    # Parse and execute any DELETE blocks
+    deleted_events = []
+    def replace_delete_block(m):
+        try:
+            data = _json.loads(m.group(1))
+            title = data.get("title", "")
+            date  = data.get("date", today_str)
+            hour  = int(data.get("hour", -1))
+            with get_db() as db:
+                row = db.execute(
+                    "SELECT id, title FROM events WHERE title = ? AND date = ? AND hour = ?",
+                    (title, date, hour)
+                ).fetchone()
+                if row:
+                    db.execute("DELETE FROM events WHERE id = ?", (row["id"],))
+                    deleted_events.append({"title": title, "date": date, "hour": hour})
+                else:
+                    # Fuzzy match: try matching by date+hour only
+                    row = db.execute(
+                        "SELECT id, title FROM events WHERE date = ? AND hour = ?",
+                        (date, hour)
+                    ).fetchone()
+                    if row:
+                        db.execute("DELETE FROM events WHERE id = ?", (row["id"],))
+                        deleted_events.append({"title": row["title"], "date": date, "hour": hour})
+        except Exception as ex:
+            print(f"Delete parse error: {ex}")
+        return ""
+
+    clean_reply = re.sub(r"<<<DELETE>>>\s*([\s\S]*?)\s*<<<END>>>", replace_delete_block, clean_reply).strip()
+
     # Append a summary of saved events
     if saved_events:
         lines = []
@@ -398,6 +445,14 @@ Rules:
             day_label = "Today" if ev["date"] == today_str else (d.strftime("%a ") + str(d.day) + d.strftime(" %b"))
             lines.append(f"  ✅ {ev['title']} — {day_label} at {str(ev['hour']).zfill(2)}:00")
         clean_reply += "\n\n📅 Added to your planner:\n" + "\n".join(lines)
+
+    if deleted_events:
+        lines = []
+        for ev in deleted_events:
+            d = datetime.strptime(ev["date"], "%Y-%m-%d")
+            day_label = "Today" if ev["date"] == today_str else (d.strftime("%a ") + str(d.day) + d.strftime(" %b"))
+            lines.append(f"  🗑️ {ev['title']} — {day_label} at {str(ev['hour']).zfill(2)}:00")
+        clean_reply += "\n\n📅 Removed from your planner:\n" + "\n".join(lines)
 
     return clean_reply or "Done!"
 
@@ -623,14 +678,27 @@ a special event block in your reply using EXACTLY this format (one per event):
 }
 <<<END>>>
 
+CRITICAL — REMOVING EVENTS:
+When the user asks you to remove, delete, or cancel an event/task, you MUST include
+a special delete block using EXACTLY this format (one per event):
+
+<<<DELETE>>>
+{
+  "title": "Event title",
+  "date": "YYYY-MM-DD",
+  "hour": 9
+}
+<<<END>>>
+
 Rules:
 - date must be YYYY-MM-DD (today is REPLACE_TODAY)
 - hour is 0-23 integer (no quotes)
 - cat is one of: work, personal, health, or "" for general
 - dur is minutes as integer: 30, 60, 90, 120, 180
-- You can include multiple <<<EVENT>>> blocks in one reply
-- Always include a natural language confirmation too, e.g. "Here's what I've prepared for you:"
-- If the user says "add a standup every day this week", emit one block per day""",
+- You can include multiple <<<EVENT>>> or <<<DELETE>>> blocks in one reply
+- Always include a natural language confirmation too
+- If the user says "add a standup every day this week", emit one block per day
+- For DELETE: match the title, date, and hour from the schedule context above""",
         schedule_ctx,
         get_contacts_context(),
         get_memories_context(),
@@ -647,7 +715,40 @@ Rules:
             system=system,
             messages=windowed,
         )
-        return jsonify({"reply": resp.content[0].text.strip()})
+        reply = resp.content[0].text.strip()
+
+        # Parse and execute DELETE blocks server-side
+        import re
+        deleted_ids = []
+        def _do_delete(m):
+            try:
+                data = _json.loads(m.group(1))
+                title = data.get("title", "")
+                date  = data.get("date", today_str)
+                hour  = int(data.get("hour", -1))
+                with get_db() as db:
+                    row = db.execute(
+                        "SELECT id FROM events WHERE title = ? AND date = ? AND hour = ?",
+                        (title, date, hour)
+                    ).fetchone()
+                    if row:
+                        db.execute("DELETE FROM events WHERE id = ?", (row["id"],))
+                        deleted_ids.append(row["id"])
+                    else:
+                        row = db.execute(
+                            "SELECT id FROM events WHERE date = ? AND hour = ?",
+                            (date, hour)
+                        ).fetchone()
+                        if row:
+                            db.execute("DELETE FROM events WHERE id = ?", (row["id"],))
+                            deleted_ids.append(row["id"])
+            except Exception as ex:
+                print(f"Chat delete parse error: {ex}")
+            return ""
+
+        reply = re.sub(r"<<<DELETE>>>\s*([\s\S]*?)\s*<<<END>>>", _do_delete, reply).strip()
+
+        return jsonify({"reply": reply, "deleted": deleted_ids})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
