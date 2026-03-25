@@ -1,0 +1,7 @@
+flask>=3.0
+flask-cors>=4.0
+apscheduler>=3.10
+anthropic>=0.25
+requests>=2.31
+pytz>=2024.1
+tzlocal>=5.0
