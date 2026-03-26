@@ -12,21 +12,20 @@ from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 import anthropic
 
-# ── Cross-platform timezone (Windows / macOS / Linux) ─────────────────────────
-def _detect_tz():
-    try:
-        import pytz
-        from tzlocal import get_localzone_name
-        return pytz.timezone(get_localzone_name())
-    except Exception:
-        try:
-            import pytz
-            return pytz.utc
-        except Exception:
-            from datetime import timezone as _tz
-            return _tz.utc
+# ── Timezone: always use UTC+3 regardless of server location ──────────────────
+from datetime import timezone
+LOCAL_TZ_OFFSET = timezone(timedelta(hours=3))
 
-LOCAL_TZ = _detect_tz()
+def now():
+    """Return current time in UTC+3."""
+    return datetime.now(LOCAL_TZ_OFFSET)
+
+# APScheduler needs a tzinfo-compatible object — use pytz if available, else stdlib
+try:
+    import pytz
+    LOCAL_TZ = pytz.timezone("Etc/GMT-3")   # pytz "Etc/GMT-3" = UTC+3
+except ImportError:
+    LOCAL_TZ = LOCAL_TZ_OFFSET
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Cross-platform date formatting ───────────────────────────────────────────
@@ -177,8 +176,8 @@ def fmt_event_list(evs):
 
 def job_morning_summary():
     """08:00 — Claude writes a motivating briefing with today's schedule."""
-    today     = datetime.now().strftime("%Y-%m-%d")
-    today_fmt = fmt_day(datetime.now())
+    today     = now().strftime("%Y-%m-%d")
+    today_fmt = fmt_day(now())
     evs       = events_for_date(today)
 
     if evs:
@@ -205,21 +204,20 @@ def job_morning_summary():
         f"_{summary}_"
     )
     send_telegram(msg)
-    print(f"[{datetime.now().strftime('%H:%M')}] Morning summary sent")
+    print(f"[{now().strftime('%H:%M')}] Morning summary sent")
 
 
 def job_event_reminder():
     """Runs every 5 min — sends a nudge 30 min before any upcoming event."""
-    now      = datetime.now()
-    today    = now.strftime("%Y-%m-%d")
+    cur      = now()
+    today    = cur.strftime("%Y-%m-%d")
     evs      = events_for_date(today)
-    target   = now + timedelta(minutes=30)
 
     for ev in evs:
         if ev["done"]:
             continue
-        ev_time = now.replace(hour=ev["hour"], minute=0, second=0, microsecond=0)
-        diff    = (ev_time - now).total_seconds() / 60
+        ev_time = cur.replace(hour=ev["hour"], minute=0, second=0, microsecond=0)
+        diff    = (ev_time - cur).total_seconds() / 60
         if 25 <= diff <= 35:
             cat_tag = f" _{ev['cat']}_" if ev.get("cat") else ""
             msg = (
@@ -229,13 +227,13 @@ def job_event_reminder():
                 f"_Time to wrap up what you're doing and get ready._"
             )
             send_telegram(msg)
-            print(f"[{now.strftime('%H:%M')}] Reminder sent for: {ev['title']}")
+            print(f"[{cur.strftime('%H:%M')}] Reminder sent for: {ev['title']}")
 
 
 def job_evening_review():
     """21:00 — Claude summarises the day and encourages planning tomorrow."""
-    today     = datetime.now().strftime("%Y-%m-%d")
-    today_fmt = fmt_day(datetime.now())
+    today     = now().strftime("%Y-%m-%d")
+    today_fmt = fmt_day(now())
     evs       = events_for_date(today)
 
     done    = [e for e in evs if     e["done"]]
@@ -262,17 +260,17 @@ def job_evening_review():
     msg += f"_{summary}_"
 
     send_telegram(msg)
-    print(f"[{datetime.now().strftime('%H:%M')}] Evening review sent")
+    print(f"[{now().strftime('%H:%M')}] Evening review sent")
 
 
 def job_weekly_nudge():
     """Sunday 19:00 — nudge to plan the upcoming week."""
-    sunday_fmt = fmt_day_short(datetime.now())
+    sunday_fmt = fmt_day_short(now())
 
     # Collect next 7 days of events
     lines = []
     for i in range(1, 8):
-        d    = datetime.now() + timedelta(days=i)
+        d    = now() + timedelta(days=i)
         evs  = events_for_date(d.strftime("%Y-%m-%d"))
         if evs:
             day_label = (d.strftime("%a ") + str(d.day))
@@ -292,7 +290,7 @@ def job_weekly_nudge():
         f"_{summary}_"
     )
     send_telegram(msg)
-    print(f"[{datetime.now().strftime('%H:%M')}] Weekly nudge sent")
+    print(f"[{now().strftime('%H:%M')}] Weekly nudge sent")
 
 
 
@@ -305,10 +303,10 @@ def handle_telegram_message(text: str, chat_id: str) -> str:
     Passes it to Claude with full context, parses any EVENT blocks,
     saves them to the DB, and returns a reply string for Telegram.
     """
-    today_str  = datetime.now().strftime("%Y-%m-%d")
+    today_str  = now().strftime("%Y-%m-%d")
     week_lines = []
     for i in range(7):
-        d   = datetime.now() + timedelta(days=i)
+        d   = now() + timedelta(days=i)
         evs = events_for_date(d.strftime("%Y-%m-%d"))
         if evs:
             label = "Today" if i == 0 else (d.strftime("%A ") + str(d.day) + d.strftime(" %b"))
@@ -319,7 +317,7 @@ def handle_telegram_message(text: str, chat_id: str) -> str:
                 for e in evs
             ))
 
-    schedule_ctx = "Today is " + fmt_day(datetime.now()) + ", " + datetime.now().strftime("%Y") + ".\n"
+    schedule_ctx = "Today is " + fmt_day(now()) + ", " + now().strftime("%Y") + ".\n"
     schedule_ctx += ("Schedule:\n" + "\n".join(week_lines)) if week_lines else "No events this week yet."
 
     system = "\n\n".join(filter(None, [
@@ -386,7 +384,7 @@ Rules for DELETE:
         try:
             data = _json.loads(m.group(1))
             ev = {
-                "id":    str(int(datetime.now().timestamp() * 1000)) + str(len(saved_events)),
+                "id":    str(int(now().timestamp() * 1000)) + str(len(saved_events)),
                 "title": data.get("title", "Untitled"),
                 "date":  data.get("date",  today_str),
                 "hour":  int(data.get("hour",  9)),
@@ -533,7 +531,7 @@ scheduler.add_job(job_keepalive,       "interval", minutes=10,                id
 # ── REST API ──────────────────────────────────────────────────────────────────
 @app.route("/ping")
 def ping():
-    return jsonify({"status": "ok", "time": datetime.now().isoformat()})
+    return jsonify({"status": "ok", "time": now().isoformat()})
 
 @app.route("/events", methods=["GET"])
 def list_events():
@@ -638,14 +636,14 @@ def chat():
     """
     body     = request.get_json()
     messages = body.get("messages", [])
-    today_str    = datetime.now().strftime("%Y-%m-%d")
-    today_fmt    = fmt_day(datetime.now()) + datetime.now().strftime(", %Y")
+    today_str    = now().strftime("%Y-%m-%d")
+    today_fmt    = fmt_day(now()) + now().strftime(", %Y")
     today_evs    = events_for_date(today_str)
 
     # Build week snapshot (today + next 6 days)
     week_lines = []
     for i in range(7):
-        d    = datetime.now() + timedelta(days=i)
+        d    = now() + timedelta(days=i)
         evs  = events_for_date(d.strftime("%Y-%m-%d"))
         if evs:
             label = "Today" if i == 0 else (d.strftime("%A ") + str(d.day) + d.strftime(" %b"))
@@ -702,7 +700,7 @@ Rules:
         schedule_ctx,
         get_contacts_context(),
         get_memories_context(),
-    ])).replace("REPLACE_TODAY", datetime.now().strftime("%Y-%m-%d"))
+    ])).replace("REPLACE_TODAY", now().strftime("%Y-%m-%d"))
 
     # Sliding window — never send more than CHAT_WINDOW messages
     windowed = messages[-CHAT_WINDOW:]
